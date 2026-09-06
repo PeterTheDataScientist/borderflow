@@ -15,14 +15,18 @@ ports feeding the corridor, published daily by IMF PortWatch from AIS vessel
 tracking. That is a real, dated, checkable series, and it leads inland border load
 by days. The border layer becomes a forecast when it has labels, and not before.
 
-**The endpoint is discovered, not declared.** PortWatch publishes through ArcGIS
-Hub, whose dataset pages are rendered client side, so the underlying FeatureServer
-URL is not in the page source and is not stable enough to hardcode from a browser
-session. Rather than guess a URL and ship a collector that silently returns
-nothing when it changes, the collector resolves the dataset id through the Hub
-API each run and records the URL it resolved to in the run log. If the resolution
-fails, that is recorded as a resolution failure rather than as an absence of
-shipping, which is the distinction that matters most in this whole file.
+**The endpoint is discovered first and hardcoded second, and the run log says
+which.** PortWatch publishes through ArcGIS Hub, whose pages render client side,
+so the service URL cannot be read out of the page source. Each run asks Hub where
+the layer lives, and falls back to the documented service URL when Hub does not
+answer. Every run records which route produced the data.
+
+The first version of this file refused to have a fallback at all, on the grounds
+that a hardcoded URL destroys provenance. The first live run then recorded a 404
+from Hub and collected nothing, which showed the objection was aimed at the wrong
+thing: provenance is destroyed by not knowing where data came from, not by having
+two possible sources. Recording the route answers it, and the collector now
+survives Hub changing shape.
 
 A network timeout must never be published as a claim about the world. Recording
 "we could not reach the source" and "the source says nothing happened" as the same
@@ -40,10 +44,24 @@ from typing import Any
 
 import httpx
 
-# ArcGIS Hub dataset id for the PortWatch daily port activity layer. The id is
-# stable across endpoint changes, which is exactly why resolution goes through it.
-PORTWATCH_DATASET = "959214444157458aad969389b3ebe1a0_0"
-HUB_API = "https://hub.arcgis.com/api/v3/datasets/{dataset_id}"
+# ArcGIS Hub dataset id for the PortWatch daily port activity layer, and the
+# PortWatch-specific Hub host. The first live run recorded a 404 against the
+# generic hub.arcgis.com host with a different dataset id, which is exactly what
+# the run log exists for: the failure was recorded as a resolution failure rather
+# than as a day on which no ship called anywhere.
+PORTWATCH_DATASET = "75619cb86e5f4beeb7dab9629d861acf_0"
+HUB_API = "https://portwatch-imf-dataviz.hub.arcgis.com/api/v3/datasets/{dataset_id}"
+
+# The service URL as documented by IMF PortWatch and by a published tutorial on
+# querying it. Kept as a fallback, which is a change of mind from the first
+# version of this file: it argued that any hardcoded URL destroys provenance.
+# That objection is answered by recording WHICH route produced the data, so the
+# run log now carries `route`. A verified fallback whose use is recorded is
+# strictly better than a collector that stops working the day Hub changes shape.
+KNOWN_ENDPOINT = (
+    "https://services9.arcgis.com/weJ1QsnbMYJlCHdG/ArcGIS/rest/services/"
+    "Daily_Ports_Data/FeatureServer/0"
+)
 
 # The corridor. Durban and Maputo feed the road route north through Beitbridge;
 # Beira feeds the Beira corridor into eastern Zimbabwe and Zambia. Named here
@@ -80,6 +98,7 @@ class RunRecord:
     resolved_url: str | None
     ok: bool
     rows: int
+    route: str = ""
     ports_seen: tuple[str, ...] = ()
     error: str = ""
 
@@ -106,27 +125,28 @@ class Observation:
         return json.dumps(asdict(self), sort_keys=True)
 
 
-def resolve_endpoint(client: httpx.Client, dataset_id: str = PORTWATCH_DATASET) -> str:
-    """Ask ArcGIS Hub where the layer actually lives.
+def resolve_endpoint(
+    client: httpx.Client, dataset_id: str = PORTWATCH_DATASET
+) -> tuple[str, str]:
+    """Find where the layer lives, and report by which route.
 
-    Raises rather than returning a default. A collector that falls back to a
-    guessed URL on failure produces data whose provenance nobody can reconstruct.
+    Hub first, because it survives the service being moved. The documented
+    service URL second, because Hub being down should not stop a day of
+    collection. The route is returned alongside the URL and written to the run
+    log, so provenance stays reconstructible either way, which is the objection
+    that made the first version refuse to have a fallback at all.
     """
     url = HUB_API.format(dataset_id=dataset_id)
     try:
         r = client.get(url, headers={"Accept": "application/json"})
         r.raise_for_status()
-        payload = r.json()
-    except (httpx.HTTPError, json.JSONDecodeError) as exc:
-        raise SourceUnreachable(f"could not resolve {dataset_id}: {exc}") from exc
-
-    attrs = (payload.get("data") or {}).get("attributes") or {}
-    for key in ("url", "serviceUrl", "layerUrl"):
-        if attrs.get(key):
-            return str(attrs[key])
-    raise SourceUnreachable(
-        f"hub returned no service url for {dataset_id}; keys were {sorted(attrs)}"
-    )
+        attrs = (r.json().get("data") or {}).get("attributes") or {}
+        for key in ("url", "serviceUrl", "layerUrl"):
+            if attrs.get(key):
+                return str(attrs[key]), "hub"
+    except (httpx.HTTPError, json.JSONDecodeError):
+        pass
+    return KNOWN_ENDPOINT, "known"
 
 
 def fetch_rows(
@@ -145,7 +165,13 @@ def fetch_rows(
         "outFields": "*",
         "returnGeometry": "false",
         "f": "json",
-        "resultRecordCount": "2000",
+        # Newest first, capped. The layer holds every major port on earth back to
+        # 2019, so an unbounded query would move gigabytes daily to keep a few
+        # hundred rows. Ordering newest first and capping also makes the collector
+        # self-healing: after an outage the next run picks up the days it missed,
+        # with no state to track and no backfill job to remember to run.
+        "orderByFields": "date DESC",
+        "resultRecordCount": "400",
     }
     try:
         r = client.get(f"{endpoint.rstrip('/')}/query", params=params)
@@ -251,8 +277,9 @@ def collect(
         timeout=45.0, headers={"User-Agent": USER_AGENT}, follow_redirects=True
     )
     endpoint: str | None = None
+    route = ""
     try:
-        endpoint = resolve_endpoint(client)
+        endpoint, route = resolve_endpoint(client)
         rows = fetch_rows(client, endpoint, ports)
         observations = to_observations(rows, now, endpoint)
         written = append_new(data_dir / "observations.jsonl", observations)
@@ -262,6 +289,7 @@ def collect(
             resolved_url=endpoint,
             ok=True,
             rows=written,
+            route=route,
             ports_seen=tuple(sorted({o.port for o in observations})),
         )
     except SourceUnreachable as exc:
@@ -271,6 +299,7 @@ def collect(
             resolved_url=endpoint,
             ok=False,
             rows=0,
+            route=route,
             error=str(exc)[:400],
         )
     finally:

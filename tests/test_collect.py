@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from borderflow.collect import (
+    KNOWN_ENDPOINT,
     PORTWATCH_DATASET,
     Observation,
     SourceUnreachable,
@@ -35,28 +36,38 @@ def _client(handler) -> httpx.Client:
 # ------------------------------------------------------------ resolution
 
 
-def test_endpoint_is_resolved_from_the_hub_api():
+def test_endpoint_is_resolved_from_the_hub_api_and_the_route_is_reported():
     def handler(request: httpx.Request) -> httpx.Response:
         assert PORTWATCH_DATASET in str(request.url)
         return httpx.Response(200, json={"data": {"attributes": {"url": ENDPOINT}}})
 
-    assert resolve_endpoint(_client(handler)) == ENDPOINT
+    assert resolve_endpoint(_client(handler)) == (ENDPOINT, "hub")
 
 
-def test_a_hub_response_without_a_url_raises_rather_than_guessing():
+def test_a_hub_response_without_a_url_falls_back_and_says_so():
+    """The fallback exists so Hub being down does not cost a day of collection.
+    It is only defensible because the route is recorded."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": {"attributes": {"name": "PortWatch"}}})
 
-    with pytest.raises(SourceUnreachable, match="no service url"):
-        resolve_endpoint(_client(handler))
+    assert resolve_endpoint(_client(handler)) == (KNOWN_ENDPOINT, "known")
 
 
-def test_a_transport_error_raises_source_unreachable():
+def test_a_hub_404_falls_back_rather_than_collecting_nothing():
+    """Exactly what the first live run hit, now covered."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "not found"})
+
+    assert resolve_endpoint(_client(handler)) == (KNOWN_ENDPOINT, "known")
+
+
+def test_a_transport_error_falls_back_to_the_documented_endpoint():
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectTimeout("timed out")
 
-    with pytest.raises(SourceUnreachable, match="could not resolve"):
-        resolve_endpoint(_client(handler))
+    assert resolve_endpoint(_client(handler)) == (KNOWN_ENDPOINT, "known")
 
 
 # ----------------------------------------------------------------- query
@@ -132,9 +143,14 @@ def test_a_new_day_for_a_known_port_is_appended(tmp_path):
 
 
 def test_a_failed_run_is_recorded_and_writes_no_observations(tmp_path):
-    """The property the dataset's honesty rests on."""
+    """The property the dataset's honesty rests on.
+
+    Resolution now falls back, so the failure has to come from the query itself.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if "hub.arcgis.com" in str(request.url):
+            return httpx.Response(404, json={"error": "not found"})
         raise httpx.ConnectTimeout("down")
 
     record = collect(tmp_path, client=_client(handler))
@@ -168,6 +184,7 @@ def test_a_successful_run_records_the_url_it_actually_resolved(tmp_path):
     assert record.ok is True
     assert record.rows == 2
     assert record.resolved_url == ENDPOINT
+    assert record.route == "hub"
     assert record.ports_seen == ("Beira", "Durban")
 
 
@@ -178,6 +195,8 @@ def test_every_run_appends_a_record_whether_it_succeeded_or_not(tmp_path):
         return httpx.Response(200, json={"features": []})
 
     def bad(request: httpx.Request) -> httpx.Response:
+        if "hub.arcgis.com" in str(request.url):
+            return httpx.Response(404, json={"error": "not found"})
         raise httpx.ConnectTimeout("down")
 
     collect(tmp_path, client=_client(ok))
