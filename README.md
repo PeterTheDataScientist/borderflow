@@ -108,5 +108,5 @@ running before the analysis exists.
 
 ## Licence
 
-Code Apache 2.0. Data CC BY 4.0. Chosen so a company can build on this without
+Code under the Apache License 2.0 (see [LICENSE](LICENSE)). Data CC BY 4.0. Chosen so a company can build on this without
 asking anyone.
